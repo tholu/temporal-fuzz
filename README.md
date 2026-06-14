@@ -172,13 +172,19 @@ For parsers that produce structured results, hash a canonical JSON representatio
 
 ## Real Adapter Smoke Tests
 
-Stdlib-only examples live in `examples/real_adapters/`:
+Real adapter examples live in `examples/real_adapters/`:
 
 - `zlib_adapter.py`
 - `gzip_adapter.py`
 - `utf8_adapter.py`
+- `bz2_adapter.py`
+- `lzma_adapter.py`
+- `zstd_adapter.py`
+- `expat_adapter.py`
 
-These wrap robust Python standard-library streaming APIs and are useful smoke tests for the tool itself. In `--mode boundary`, they should produce zero findings because chunking alone should not change decoded output. In `--mode stateful` and `--mode chaos`, findings may be intentional: controls such as `RESET` change decoder state, and chaos mode can generate non-equivalent streams.
+These wrap robust streaming APIs and are useful smoke tests for the tool itself. In `--mode boundary`, they should produce zero findings because chunking alone should not change decoded output. In `--mode stateful` and `--mode chaos`, findings may be intentional: controls such as `RESET` change decoder state, and chaos mode can generate non-equivalent streams.
+
+Most adapters are Python standard-library only. `zstd_adapter.py` uses `ctypes` and requires a loadable system `libzstd`; set `ZSTD_LIB` if system lookup does not find it. `expat_adapter.py` demonstrates an adapter-authoring pattern for event parsers: hash normalized semantic output, not raw callback boundaries.
 
 ## Example Workflow
 

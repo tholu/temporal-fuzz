@@ -399,6 +399,50 @@ fn real_utf8_adapter_boundary_mode_produces_zero_findings() {
 }
 
 #[test]
+fn our_lib_expat_adapter_boundary_mode_produces_zero_findings() {
+    let dir = temp_dir("our-lib-expat");
+    let input = dir.join("sample.xml");
+    let out_dir = dir.join("findings");
+    fs::write(
+        &input,
+        r#"<root><item id="1">hello <![CDATA[world]]></item><item>snowman: &#9731;</item></root>"#,
+    )
+    .unwrap();
+
+    let run = Command::new(bin())
+        .args([
+            "run",
+            "--mode",
+            "boundary",
+            "--target",
+            "python3",
+            "--target-arg",
+            &repo_path("examples/real_adapters/expat_adapter.py"),
+            "--input",
+            input.to_str().unwrap(),
+            "--iterations",
+            "100",
+            "--seed",
+            "1",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert_eq!(count_saved_findings(&out_dir), 0);
+    let run_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run_json["summary"]["divergences"].as_u64(), Some(0));
+    assert_eq!(run_json["summary"]["saved_findings"].as_u64(), Some(0));
+}
+
+#[test]
 fn duplicate_suppression_can_be_disabled() {
     let dir = temp_dir("dedup");
     let input = dir.join("sample.bin");
