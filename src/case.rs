@@ -18,12 +18,64 @@ pub enum Op {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleClass {
+    EquivalentBoundary,
+    StatefulControl,
+    NonEquivalentStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleMetadata {
+    pub schedule_class: ScheduleClass,
+    pub baseline_equivalent: bool,
+    pub effective_stream_hash: String,
+    pub effective_stream_len: usize,
+}
+
+impl ScheduleMetadata {
+    pub fn from_ops(payload: &[u8], ops: &[Op]) -> Self {
+        let effective_stream = effective_stream(payload, ops);
+        let effective_stream_hash = stable_hash_hex(&effective_stream);
+        let baseline_equivalent = is_baseline_equivalent(payload, ops);
+        let has_control = ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::FeedZero
+                    | Op::Flush
+                    | Op::Drain
+                    | Op::Reset
+                    | Op::Reconfigure { .. }
+                    | Op::Seek { .. }
+                    | Op::Close
+            )
+        });
+        let schedule_class = if !baseline_equivalent {
+            ScheduleClass::NonEquivalentStream
+        } else if has_control {
+            ScheduleClass::StatefulControl
+        } else {
+            ScheduleClass::EquivalentBoundary
+        };
+
+        Self {
+            schedule_class,
+            baseline_equivalent,
+            effective_stream_hash,
+            effective_stream_len: effective_stream.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalCase {
     pub input_filename: Option<String>,
     pub payload_b64: String,
     pub payload_hash: String,
     pub ops: Vec<Op>,
+    #[serde(flatten)]
+    pub schedule_metadata: ScheduleMetadata,
     pub seed: Option<u64>,
     pub description: Option<String>,
 }
@@ -39,6 +91,7 @@ impl TemporalCase {
             input_filename,
             payload_b64: base64_encode(payload),
             payload_hash: stable_hash_hex(payload),
+            schedule_metadata: ScheduleMetadata::from_ops(payload, &ops),
             ops,
             seed,
             description: None,
@@ -126,6 +179,8 @@ pub struct Finding {
     #[serde(default)]
     pub payload_path: Option<String>,
     pub schedule: Vec<Op>,
+    #[serde(flatten)]
+    pub schedule_metadata: ScheduleMetadata,
     pub baseline_result: RunOutcome,
     pub variant_result: RunOutcome,
     pub stderr_snippets: Vec<String>,
@@ -166,6 +221,56 @@ pub fn stable_hash_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+fn effective_stream(payload: &[u8], ops: &[Op]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for op in ops {
+        if let Op::Feed { offset, len } = *op {
+            if offset >= payload.len() {
+                continue;
+            }
+            let end = offset.saturating_add(len).min(payload.len());
+            out.extend_from_slice(&payload[offset..end]);
+        }
+    }
+    out
+}
+
+fn is_baseline_equivalent(payload: &[u8], ops: &[Op]) -> bool {
+    if !matches!(ops.last(), Some(Op::Eos)) {
+        return false;
+    }
+    if ops.iter().filter(|op| matches!(op, Op::Eos)).count() != 1 {
+        return false;
+    }
+    if ops.iter().any(|op| matches!(op, Op::Close)) {
+        return false;
+    }
+
+    let mut expected_offset = 0;
+    for op in ops {
+        match *op {
+            Op::Feed { offset, len } => {
+                if len == 0 || offset != expected_offset {
+                    return false;
+                }
+                expected_offset = match expected_offset.checked_add(len) {
+                    Some(next) if next <= payload.len() => next,
+                    _ => return false,
+                };
+            }
+            Op::Eos => {}
+            Op::FeedZero
+            | Op::Flush
+            | Op::Drain
+            | Op::Reset
+            | Op::Reconfigure { .. }
+            | Op::Seek { .. }
+            | Op::Close => {}
+        }
+    }
+    expected_offset == payload.len()
 }
 
 pub fn snippet(text: &str, max_chars: usize) -> String {
@@ -237,7 +342,9 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_decode, base64_encode, stable_hash_hex};
+    use super::{
+        base64_decode, base64_encode, stable_hash_hex, Op, ScheduleClass, ScheduleMetadata,
+    };
 
     #[test]
     fn base64_round_trips_payloads() {
@@ -257,5 +364,47 @@ mod tests {
     #[test]
     fn stable_hash_is_stable() {
         assert_eq!(stable_hash_hex(b"abc"), "fnv1a64:e71fa2190541574b");
+    }
+
+    #[test]
+    fn schedule_metadata_detects_boundary_equivalence() {
+        let payload = b"abcdef";
+        let ops = vec![
+            Op::Feed { offset: 0, len: 2 },
+            Op::Feed { offset: 2, len: 4 },
+            Op::Eos,
+        ];
+        let metadata = ScheduleMetadata::from_ops(payload, &ops);
+        assert_eq!(metadata.schedule_class, ScheduleClass::EquivalentBoundary);
+        assert!(metadata.baseline_equivalent);
+        assert_eq!(metadata.effective_stream_len, payload.len());
+        assert_eq!(metadata.effective_stream_hash, stable_hash_hex(payload));
+    }
+
+    #[test]
+    fn schedule_metadata_detects_non_equivalent_streams() {
+        let payload = b"abcdef";
+        let ops = vec![
+            Op::Feed { offset: 2, len: 2 },
+            Op::Feed { offset: 0, len: 2 },
+            Op::Eos,
+        ];
+        let metadata = ScheduleMetadata::from_ops(payload, &ops);
+        assert_eq!(metadata.schedule_class, ScheduleClass::NonEquivalentStream);
+        assert!(!metadata.baseline_equivalent);
+    }
+
+    #[test]
+    fn schedule_metadata_labels_stateful_controls() {
+        let payload = b"abcdef";
+        let ops = vec![
+            Op::Feed { offset: 0, len: 3 },
+            Op::Reset,
+            Op::Feed { offset: 3, len: 3 },
+            Op::Eos,
+        ];
+        let metadata = ScheduleMetadata::from_ops(payload, &ops);
+        assert_eq!(metadata.schedule_class, ScheduleClass::StatefulControl);
+        assert!(metadata.baseline_equivalent);
     }
 }

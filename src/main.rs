@@ -4,11 +4,14 @@ mod minimize;
 mod runner;
 mod schedule;
 
-use crate::case::{now_unix_secs, Finding, FindingClass, OutcomeKind, TemporalCase};
+use crate::case::{
+    now_unix_secs, Finding, FindingClass, OutcomeKind, ScheduleMetadata, TemporalCase,
+};
 use crate::classifier::classify;
 use crate::minimize::{minimize_schedule, FailurePredicate};
 use crate::runner::run_adapter;
-use crate::schedule::ScheduleGenerator;
+use crate::schedule::{ScheduleGenerator, ScheduleMode};
+use serde::Serialize;
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -26,6 +29,8 @@ enum Command {
         timeout_ms: u64,
         progress_every: usize,
         embed_payload: bool,
+        mode: ScheduleMode,
+        out_dir: PathBuf,
     },
     Replay {
         target: Vec<String>,
@@ -37,6 +42,7 @@ enum Command {
         out: PathBuf,
         count: usize,
         seed: u64,
+        mode: ScheduleMode,
     },
     Minimize {
         target: Vec<String>,
@@ -44,10 +50,12 @@ enum Command {
         out: PathBuf,
         timeout_ms: u64,
         embed_payload: bool,
+        mode: ScheduleMode,
     },
+    Help(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize)]
 struct Summary {
     total: usize,
     crashes: usize,
@@ -68,6 +76,22 @@ struct RunOptions<'a> {
     timeout_ms: u64,
     progress_every: usize,
     embed_payload: bool,
+    mode: ScheduleMode,
+    out_dir: &'a Path,
+}
+
+#[derive(Debug, Serialize)]
+struct RunMetadata {
+    command_line: Vec<String>,
+    target_argv: Vec<String>,
+    seed: u64,
+    mode: ScheduleMode,
+    input_path: String,
+    corpus_path: Option<String>,
+    iterations: usize,
+    timeout_ms: u64,
+    summary: Summary,
+    timestamp: u64,
 }
 
 fn main() {
@@ -90,6 +114,8 @@ fn real_main() -> Result<(), String> {
             timeout_ms,
             progress_every,
             embed_payload,
+            mode,
+            out_dir,
         } => run_command(RunOptions {
             command_line: &args,
             target: &target,
@@ -100,6 +126,8 @@ fn real_main() -> Result<(), String> {
             timeout_ms,
             progress_every,
             embed_payload,
+            mode,
+            out_dir: &out_dir,
         }),
         Command::Replay {
             target,
@@ -111,19 +139,33 @@ fn real_main() -> Result<(), String> {
             out,
             count,
             seed,
-        } => generate_command(&input, &out, count, seed),
+            mode,
+        } => generate_command(&input, &out, count, seed, mode),
         Command::Minimize {
             target,
             case_path,
             out,
             timeout_ms,
             embed_payload,
-        } => minimize_command(&args, &target, &case_path, &out, timeout_ms, embed_payload),
+            mode,
+        } => minimize_command(
+            &args,
+            &target,
+            &case_path,
+            &out,
+            timeout_ms,
+            embed_payload,
+            mode,
+        ),
+        Command::Help(text) => {
+            println!("{text}");
+            Ok(())
+        }
     }
 }
 
 fn run_command(options: RunOptions<'_>) -> Result<(), String> {
-    ensure_output_dirs()?;
+    ensure_output_dirs(options.out_dir)?;
     let inputs = collect_input_paths(options.input, options.corpus)?;
     let mut summary = Summary::default();
 
@@ -145,7 +187,7 @@ fn run_command(options: RunOptions<'_>) -> Result<(), String> {
         let mut generator = ScheduleGenerator::new(options.seed);
 
         for iteration in 0..options.iterations {
-            let case = generator.next_case(input_name.clone(), &payload, iteration);
+            let case = generator.next_case(input_name.clone(), &payload, iteration, options.mode);
             let variant = run_adapter(options.target, &payload, &case.ops, options.timeout_ms);
             summary.total += 1;
 
@@ -158,13 +200,20 @@ fn run_command(options: RunOptions<'_>) -> Result<(), String> {
                     payload_b64: Some(case.payload_b64.clone()),
                     payload_path: None,
                     schedule: case.ops.clone(),
+                    schedule_metadata: case.schedule_metadata.clone(),
                     baseline_result: baseline.clone(),
                     variant_result: variant.clone(),
                     stderr_snippets: vec![baseline.stderr_snippet(), variant.stderr_snippet()],
                     command_line: options.command_line.to_vec(),
                     timestamp: now_unix_secs(),
                 };
-                save_finding(&finding, iteration, options.embed_payload, &payload)?;
+                save_finding(
+                    &finding,
+                    iteration,
+                    options.embed_payload,
+                    &payload,
+                    options.out_dir,
+                )?;
             }
 
             if options.progress_every > 0 && summary.total % options.progress_every == 0 {
@@ -190,6 +239,19 @@ fn run_command(options: RunOptions<'_>) -> Result<(), String> {
         summary.interesting,
         summary.baseline_failures
     );
+    let run_metadata = RunMetadata {
+        command_line: options.command_line.to_vec(),
+        target_argv: options.target.to_vec(),
+        seed: options.seed,
+        mode: options.mode,
+        input_path: options.input.display().to_string(),
+        corpus_path: options.corpus.map(|path| path.display().to_string()),
+        iterations: options.iterations,
+        timeout_ms: options.timeout_ms,
+        summary,
+        timestamp: now_unix_secs(),
+    };
+    write_json(&options.out_dir.join("run.json"), &run_metadata)?;
     Ok(())
 }
 
@@ -217,14 +279,20 @@ fn replay_command(target: &[String], case_path: &Path, timeout_ms: u64) -> Resul
     Ok(())
 }
 
-fn generate_command(input: &Path, out: &Path, count: usize, seed: u64) -> Result<(), String> {
+fn generate_command(
+    input: &Path,
+    out: &Path,
+    count: usize,
+    seed: u64,
+    mode: ScheduleMode,
+) -> Result<(), String> {
     let payload =
         fs::read(input).map_err(|err| format!("failed to read {}: {err}", input.display()))?;
     fs::create_dir_all(out).map_err(|err| format!("failed to create {}: {err}", out.display()))?;
     let mut generator = ScheduleGenerator::new(seed);
 
     for idx in 0..count {
-        let case = generator.next_case(Some(input.display().to_string()), &payload, idx);
+        let case = generator.next_case(Some(input.display().to_string()), &payload, idx, mode);
         let path = out.join(format!("case-{idx:06}.json"));
         write_json(&path, &case)?;
     }
@@ -239,6 +307,7 @@ fn minimize_command(
     out: &Path,
     timeout_ms: u64,
     embed_payload: bool,
+    mode: ScheduleMode,
 ) -> Result<(), String> {
     let loaded = load_case_or_finding(case_path)?;
     let payload = loaded.payload()?;
@@ -256,6 +325,7 @@ fn minimize_command(
         &baseline,
         &predicate,
         timeout_ms,
+        mode,
     );
     let finding = Finding {
         finding_class: predicate.class(),
@@ -263,6 +333,7 @@ fn minimize_command(
         payload_hash: loaded.payload_hash().to_string(),
         payload_b64: Some(loaded.payload_b64()?),
         payload_path: None,
+        schedule_metadata: ScheduleMetadata::from_ops(&payload, &minimized_ops),
         schedule: minimized_ops,
         baseline_result: baseline,
         variant_result: minimized_outcome,
@@ -377,9 +448,13 @@ fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))
 }
 
-fn ensure_output_dirs() -> Result<(), String> {
+fn ensure_output_dirs(out_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(out_dir)
+        .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
     for dir in ["crashes", "hangs", "divergences", "interesting"] {
-        fs::create_dir_all(dir).map_err(|err| format!("failed to create {dir}: {err}"))?;
+        let path = out_dir.join(dir);
+        fs::create_dir_all(&path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     }
     Ok(())
 }
@@ -389,10 +464,12 @@ fn save_finding(
     iteration: usize,
     embed_payload: bool,
     payload: &[u8],
+    out_dir: &Path,
 ) -> Result<(), String> {
     let dir = finding.finding_class.dir_name();
-    let path = Path::new(dir).join(format!("id-{}-{iteration:06}.json", finding.timestamp));
-    let finding = prepare_finding_payload(finding.clone(), Path::new(dir), embed_payload, payload)?;
+    let finding_dir = out_dir.join(dir);
+    let path = finding_dir.join(format!("id-{}-{iteration:06}.json", finding.timestamp));
+    let finding = prepare_finding_payload(finding.clone(), &finding_dir, embed_payload, payload)?;
     write_json(&path, &finding)
 }
 
@@ -444,9 +521,23 @@ fn increment_summary(summary: &mut Summary, class: FindingClass) {
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
+    if args.len() == 2 && is_help_flag(&args[1]) {
+        return Ok(Command::Help(root_usage()));
+    }
+
     let Some(subcommand) = args.get(1).map(String::as_str) else {
-        return Err(usage());
+        return Err(root_usage());
     };
+
+    if args.len() == 3 && is_help_flag(&args[2]) {
+        return match subcommand {
+            "run" => Ok(Command::Help(run_usage())),
+            "replay" => Ok(Command::Help(replay_usage())),
+            "generate" => Ok(Command::Help(generate_usage())),
+            "minimize" => Ok(Command::Help(minimize_usage())),
+            _ => Err(root_usage()),
+        };
+    }
 
     match subcommand {
         "run" => {
@@ -462,6 +553,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     "--timeout-ms",
                     "--progress-every",
                     "--embed-payload",
+                    "--mode",
+                    "--out-dir",
                 ],
                 &["--target-arg"],
             )?;
@@ -474,6 +567,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 timeout_ms: flags.parse_optional("--timeout-ms", 1000)?,
                 progress_every: flags.parse_optional("--progress-every", 100)?,
                 embed_payload: flags.parse_bool_optional("--embed-payload", true)?,
+                mode: flags.parse_mode_optional("--mode", ScheduleMode::Boundary)?,
+                out_dir: PathBuf::from(
+                    flags
+                        .optional("--out-dir")
+                        .unwrap_or_else(|| ".".to_string()),
+                ),
             })
         }
         "replay" => {
@@ -489,12 +588,17 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             })
         }
         "generate" => {
-            let flags = parse_flags(&args[2..], &["--input", "--out", "--count", "--seed"], &[])?;
+            let flags = parse_flags(
+                &args[2..],
+                &["--input", "--out", "--count", "--seed", "--mode"],
+                &[],
+            )?;
             Ok(Command::Generate {
                 input: PathBuf::from(flags.required("--input")?),
                 out: PathBuf::from(flags.required("--out")?),
                 count: flags.parse_optional("--count", 100)?,
                 seed: flags.parse_optional("--seed", now_unix_secs())?,
+                mode: flags.parse_mode_optional("--mode", ScheduleMode::Boundary)?,
             })
         }
         "minimize" => {
@@ -507,6 +611,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     "--out",
                     "--timeout-ms",
                     "--embed-payload",
+                    "--mode",
                 ],
                 &["--target-arg"],
             )?;
@@ -516,9 +621,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 out: PathBuf::from(flags.required("--out")?),
                 timeout_ms: flags.parse_optional("--timeout-ms", 1000)?,
                 embed_payload: flags.parse_bool_optional("--embed-payload", true)?,
+                mode: flags.parse_mode_optional("--mode", ScheduleMode::Boundary)?,
             })
         }
-        _ => Err(usage()),
+        _ => Err(root_usage()),
     }
 }
 
@@ -530,7 +636,7 @@ struct Flags {
 impl Flags {
     fn required(&self, flag: &str) -> Result<String, String> {
         self.optional(flag)
-            .ok_or_else(|| format!("missing required flag {flag}\n\n{}", usage()))
+            .ok_or_else(|| format!("missing required flag {flag}\n\n{}", root_usage()))
     }
 
     fn optional(&self, flag: &str) -> Option<String> {
@@ -571,6 +677,17 @@ impl Flags {
             None => Ok(default),
         }
     }
+
+    fn parse_mode_optional(
+        &self,
+        flag: &str,
+        default: ScheduleMode,
+    ) -> Result<ScheduleMode, String> {
+        match self.optional(flag) {
+            Some(value) => ScheduleMode::parse(&value),
+            None => Ok(default),
+        }
+    }
 }
 
 fn parse_flags(args: &[String], allowed: &[&str], repeatable: &[&str]) -> Result<Flags, String> {
@@ -581,20 +698,20 @@ fn parse_flags(args: &[String], allowed: &[&str], repeatable: &[&str]) -> Result
         if !flag.starts_with("--") {
             return Err(format!(
                 "unexpected positional argument: {flag}\n\n{}",
-                usage()
+                root_usage()
             ));
         }
         if !allowed.contains(&flag) {
-            return Err(format!("unknown flag {flag}\n\n{}", usage()));
+            return Err(format!("unknown flag {flag}\n\n{}", root_usage()));
         }
         let Some(value) = args.get(idx + 1) else {
-            return Err(format!("missing value for {flag}\n\n{}", usage()));
+            return Err(format!("missing value for {flag}\n\n{}", root_usage()));
         };
         if value.starts_with("--") {
-            return Err(format!("missing value for {flag}\n\n{}", usage()));
+            return Err(format!("missing value for {flag}\n\n{}", root_usage()));
         }
         if !repeatable.contains(&flag) && values.iter().any(|(existing, _)| existing == flag) {
-            return Err(format!("duplicate flag {flag}\n\n{}", usage()));
+            return Err(format!("duplicate flag {flag}\n\n{}", root_usage()));
         }
         values.push((flag.to_string(), value.clone()));
         idx += 2;
@@ -618,11 +735,55 @@ fn target_argv(flags: &Flags) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-fn usage() -> String {
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "-h" | "--help")
+}
+
+fn root_usage() -> String {
     "usage:
-  temporal-fuzz run --target ./adapter [--target-arg ARG ...] --input sample.bin --iterations 10000 [--seed N] [--timeout-ms N] [--corpus DIR] [--embed-payload true|false]
+  temporal-fuzz run --target ./adapter [--target-arg ARG ...] --input sample.bin --iterations 10000 [--mode boundary|stateful|chaos] [--out-dir DIR] [--seed N] [--timeout-ms N] [--corpus DIR] [--embed-payload true|false]
   temporal-fuzz replay --target ./adapter [--target-arg ARG ...] --case crashes/id.json [--timeout-ms N]
-  temporal-fuzz generate --input sample.bin --out cases/ --count 1000 [--seed N]
-  temporal-fuzz minimize --target ./adapter [--target-arg ARG ...] --case crashes/id.json --out minimized.json [--timeout-ms N] [--embed-payload true|false]"
+  temporal-fuzz generate --input sample.bin --out cases/ --count 1000 [--mode boundary|stateful|chaos] [--seed N]
+  temporal-fuzz minimize --target ./adapter [--target-arg ARG ...] --case crashes/id.json --out minimized.json [--mode boundary|stateful|chaos] [--timeout-ms N] [--embed-payload true|false]
+
+Use temporal-fuzz <command> --help for command-specific options."
+        .to_string()
+}
+
+fn run_usage() -> String {
+    "usage:
+  temporal-fuzz run --target ./adapter [--target-arg ARG ...] --input sample.bin --iterations 10000 [options]
+
+options:
+  --mode boundary|stateful|chaos   Schedule generation mode (default: boundary)
+  --out-dir DIR                    Directory for run.json and finding subdirs (default: .)
+  --seed N                         Deterministic schedule seed
+  --timeout-ms N                   Per-adapter timeout (default: 1000)
+  --corpus DIR                     Additional input corpus directory
+  --progress-every N               Progress interval (default: 100)
+  --embed-payload true|false       Embed payload bytes in findings (default: true)"
+        .to_string()
+}
+
+fn replay_usage() -> String {
+    "usage:
+  temporal-fuzz replay --target ./adapter [--target-arg ARG ...] --case crashes/id.json [--timeout-ms N]"
+        .to_string()
+}
+
+fn generate_usage() -> String {
+    "usage:
+  temporal-fuzz generate --input sample.bin --out cases/ --count 1000 [--mode boundary|stateful|chaos] [--seed N]"
+        .to_string()
+}
+
+fn minimize_usage() -> String {
+    "usage:
+  temporal-fuzz minimize --target ./adapter [--target-arg ARG ...] --case crashes/id.json --out minimized.json [options]
+
+options:
+  --mode boundary|stateful|chaos   Minimize under mode invariants (default: boundary)
+  --timeout-ms N                   Per-adapter timeout (default: 1000)
+  --embed-payload true|false       Embed payload bytes in output finding (default: true)"
         .to_string()
 }

@@ -1,4 +1,26 @@
 use crate::case::{Op, TemporalCase};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleMode {
+    Boundary,
+    Stateful,
+    Chaos,
+}
+
+impl ScheduleMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "boundary" => Ok(Self::Boundary),
+            "stateful" => Ok(Self::Stateful),
+            "chaos" => Ok(Self::Chaos),
+            _ => Err(format!(
+                "invalid mode {value}; expected boundary, stateful, or chaos"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ScheduleGenerator {
@@ -37,14 +59,28 @@ impl ScheduleGenerator {
         input_filename: Option<String>,
         payload: &[u8],
         iteration: usize,
+        mode: ScheduleMode,
     ) -> TemporalCase {
-        let ops = self.next_ops(payload, iteration);
+        let ops = self.next_ops_for_mode(payload, iteration, mode);
         let mut case = TemporalCase::new(input_filename, payload, ops, Some(self.seed));
-        case.description = Some(format!("generated iteration {iteration}"));
+        case.description = Some(format!("generated {mode:?} iteration {iteration}"));
         case
     }
 
-    pub fn next_ops(&mut self, payload: &[u8], iteration: usize) -> Vec<Op> {
+    pub fn next_ops_for_mode(
+        &mut self,
+        payload: &[u8],
+        iteration: usize,
+        mode: ScheduleMode,
+    ) -> Vec<Op> {
+        match mode {
+            ScheduleMode::Boundary => self.boundary_ops(payload, iteration),
+            ScheduleMode::Stateful => self.stateful_ops(payload, iteration),
+            ScheduleMode::Chaos => self.chaos_ops(payload, iteration),
+        }
+    }
+
+    fn chaos_ops(&mut self, payload: &[u8], iteration: usize) -> Vec<Op> {
         if iteration == 0 {
             return Self::baseline(payload.len());
         }
@@ -59,6 +95,57 @@ impl ScheduleGenerator {
             3 => self.mutate_ops(Self::chunked_interesting(payload), payload.len()),
             _ => self.header_aware(payload),
         }
+    }
+
+    fn boundary_ops(&mut self, payload: &[u8], iteration: usize) -> Vec<Op> {
+        if iteration == 0 {
+            return Self::baseline(payload.len());
+        }
+        if iteration == 1 {
+            return Self::chunked_interesting(payload);
+        }
+
+        match iteration % 4 {
+            0 => self.random_chunked(payload.len(), false),
+            1 => self.random_chunked(payload.len(), false),
+            2 => self.boundary_header_aware(payload),
+            _ => self.even_chunks(payload.len()),
+        }
+    }
+
+    fn stateful_ops(&mut self, payload: &[u8], iteration: usize) -> Vec<Op> {
+        if iteration == 0 {
+            return Self::baseline(payload.len());
+        }
+
+        let mut ops = match iteration % 4 {
+            0 => self.random_chunked(payload.len(), false),
+            1 => Self::chunked_interesting(payload),
+            2 => self.boundary_header_aware(payload),
+            _ => self.even_chunks(payload.len()),
+        };
+
+        let insert_limit = ops.len().saturating_sub(1).max(1);
+        match iteration % 6 {
+            0 => ops.insert(self.rng.usize(insert_limit), Op::Flush),
+            1 => ops.insert(self.rng.usize(insert_limit), Op::Drain),
+            2 => ops.insert(self.rng.usize(insert_limit), Op::FeedZero),
+            3 => ops.insert(self.rng.usize(insert_limit), Op::Reset),
+            4 => ops.insert(
+                self.rng.usize(insert_limit),
+                Op::Reconfigure {
+                    mode: self.rng.u32(4),
+                    limit: self.rng.u32(1024),
+                },
+            ),
+            _ => ops.insert(
+                self.rng.usize(insert_limit),
+                Op::Seek {
+                    offset: self.rng.usize(payload.len().saturating_add(1)),
+                },
+            ),
+        }
+        ops
     }
 
     fn random_chunked(&mut self, payload_len: usize, controls: bool) -> Vec<Op> {
@@ -119,6 +206,34 @@ impl ScheduleGenerator {
         if self.rng.usize(4) == 0 {
             ops.insert(self.rng.usize(ops.len().max(1)), Op::Drain);
         }
+        ops
+    }
+
+    fn boundary_header_aware(&mut self, payload: &[u8]) -> Vec<Op> {
+        let mut points = split_points(payload);
+        let max_extra = payload.len().min(8);
+        for _ in 0..max_extra {
+            points.push(self.rng.usize(payload.len().saturating_add(1)));
+        }
+        points.sort_unstable();
+        points.dedup();
+        feed_ops_from_points(payload.len(), &points, true)
+    }
+
+    fn even_chunks(&mut self, payload_len: usize) -> Vec<Op> {
+        if payload_len == 0 {
+            return Self::baseline(payload_len);
+        }
+
+        let chunk_len = 1 + self.rng.usize(payload_len.min(64));
+        let mut ops = Vec::new();
+        let mut offset = 0;
+        while offset < payload_len {
+            let len = chunk_len.min(payload_len - offset);
+            ops.push(Op::Feed { offset, len });
+            offset += len;
+        }
+        ops.push(Op::Eos);
         ops
     }
 
@@ -296,7 +411,7 @@ impl Lcg {
 
 #[cfg(test)]
 mod tests {
-    use super::ScheduleGenerator;
+    use super::{ScheduleGenerator, ScheduleMode};
     use crate::case::Op;
 
     #[test]
@@ -304,7 +419,7 @@ mod tests {
         let payload = b"LEN:0010\nabcdefghij";
         let mut generator = ScheduleGenerator::new(123);
 
-        let baseline = generator.next_ops(payload, 0);
+        let baseline = generator.next_ops_for_mode(payload, 0, ScheduleMode::Boundary);
         assert_eq!(
             baseline,
             vec![
@@ -316,12 +431,27 @@ mod tests {
             ]
         );
 
-        let chunked = generator.next_ops(payload, 1);
+        let chunked = generator.next_ops_for_mode(payload, 1, ScheduleMode::Boundary);
         let feeds = chunked
             .iter()
             .filter(|op| matches!(op, Op::Feed { .. }))
             .count();
         assert!(feeds > 1, "expected multiple FEED ops, got {chunked:?}");
         assert!(chunked.iter().any(|op| matches!(op, Op::Eos)));
+    }
+
+    #[test]
+    fn boundary_mode_generates_only_feeds_and_eos() {
+        let payload = b"LEN:0010\nabcdefghij";
+        let mut generator = ScheduleGenerator::new(123);
+
+        for iteration in 0..100 {
+            let ops = generator.next_ops_for_mode(payload, iteration, ScheduleMode::Boundary);
+            assert!(
+                ops.iter().all(|op| matches!(op, Op::Feed { .. } | Op::Eos)),
+                "unexpected boundary op in {ops:?}"
+            );
+            assert!(matches!(ops.last(), Some(Op::Eos)));
+        }
     }
 }

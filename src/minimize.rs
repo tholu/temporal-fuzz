@@ -1,6 +1,7 @@
-use crate::case::{FindingClass, Op, OutcomeKind, RunOutcome};
+use crate::case::{FindingClass, Op, OutcomeKind, RunOutcome, ScheduleClass, ScheduleMetadata};
 use crate::classifier::classify;
 use crate::runner::run_adapter;
+use crate::schedule::ScheduleMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailurePredicate {
@@ -83,10 +84,11 @@ pub fn minimize_schedule(
     baseline: &RunOutcome,
     predicate: &FailurePredicate,
     timeout_ms: u64,
+    mode: ScheduleMode,
 ) -> (Vec<Op>, RunOutcome) {
     let mut ops = initial_ops.to_vec();
     let mut outcome = run_adapter(target, payload, &ops, timeout_ms);
-    if !predicate.matches(baseline, &outcome) {
+    if !candidate_allowed(payload, &ops, mode) || !predicate.matches(baseline, &outcome) {
         return (ops, outcome);
     }
 
@@ -97,6 +99,9 @@ pub fn minimize_schedule(
             let mut candidate = ops.clone();
             candidate.remove(idx);
             if candidate.is_empty() {
+                continue;
+            }
+            if !candidate_allowed(payload, &candidate, mode) {
                 continue;
             }
             let candidate_outcome = run_adapter(target, payload, &candidate, timeout_ms);
@@ -111,28 +116,47 @@ pub fn minimize_schedule(
 
     let merged = merge_adjacent_feeds(&ops);
     let merged_outcome = run_adapter(target, payload, &merged, timeout_ms);
-    if predicate.matches(baseline, &merged_outcome) {
+    if candidate_allowed(payload, &merged, mode) && predicate.matches(baseline, &merged_outcome) {
         ops = merged;
         outcome = merged_outcome;
     }
 
     let simplified = simplify_values(&ops);
     let simplified_outcome = run_adapter(target, payload, &simplified, timeout_ms);
-    if predicate.matches(baseline, &simplified_outcome) {
+    if candidate_allowed(payload, &simplified, mode)
+        && predicate.matches(baseline, &simplified_outcome)
+    {
         ops = simplified;
         outcome = simplified_outcome;
     }
 
-    shrink_feed_lengths(
+    let context = ShrinkContext {
         target,
         payload,
         baseline,
         predicate,
         timeout_ms,
-        &mut ops,
-        &mut outcome,
-    );
+        mode,
+    };
+    shrink_feed_lengths(&context, &mut ops, &mut outcome);
     (ops, outcome)
+}
+
+struct ShrinkContext<'a> {
+    target: &'a [String],
+    payload: &'a [u8],
+    baseline: &'a RunOutcome,
+    predicate: &'a FailurePredicate,
+    timeout_ms: u64,
+    mode: ScheduleMode,
+}
+
+fn candidate_allowed(payload: &[u8], ops: &[Op], mode: ScheduleMode) -> bool {
+    if mode != ScheduleMode::Boundary {
+        return true;
+    }
+    let metadata = ScheduleMetadata::from_ops(payload, ops);
+    metadata.baseline_equivalent && metadata.schedule_class == ScheduleClass::EquivalentBoundary
 }
 
 fn merge_adjacent_feeds(ops: &[Op]) -> Vec<Op> {
@@ -164,15 +188,7 @@ fn simplify_values(ops: &[Op]) -> Vec<Op> {
         .collect()
 }
 
-fn shrink_feed_lengths(
-    target: &[String],
-    payload: &[u8],
-    baseline: &RunOutcome,
-    predicate: &FailurePredicate,
-    timeout_ms: u64,
-    ops: &mut Vec<Op>,
-    outcome: &mut RunOutcome,
-) {
+fn shrink_feed_lengths(context: &ShrinkContext<'_>, ops: &mut Vec<Op>, outcome: &mut RunOutcome) {
     for idx in 0..ops.len() {
         let Op::Feed { len, .. } = ops[idx] else {
             continue;
@@ -184,8 +200,22 @@ fn shrink_feed_lengths(
             if let Op::Feed { len, .. } = &mut candidate[idx] {
                 *len = candidate_len;
             }
-            let candidate_outcome = run_adapter(target, payload, &candidate, timeout_ms);
-            if predicate.matches(baseline, &candidate_outcome) {
+            if !candidate_allowed(context.payload, &candidate, context.mode) {
+                if candidate_len == 1 {
+                    break;
+                }
+                continue;
+            }
+            let candidate_outcome = run_adapter(
+                context.target,
+                context.payload,
+                &candidate,
+                context.timeout_ms,
+            );
+            if context
+                .predicate
+                .matches(context.baseline, &candidate_outcome)
+            {
                 *ops = candidate;
                 *outcome = candidate_outcome;
             } else if candidate_len == 1 {
