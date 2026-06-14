@@ -1,0 +1,7 @@
+/target/
+/crashes/
+/hangs/
+/divergences/
+/interesting/
+/cases/
+/minimized.json
