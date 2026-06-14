@@ -359,6 +359,46 @@ fn boundary_mode_echo_adapter_produces_zero_findings() {
 }
 
 #[test]
+fn real_utf8_adapter_boundary_mode_produces_zero_findings() {
+    let dir = temp_dir("real-utf8");
+    let input = dir.join("sample.txt");
+    let out_dir = dir.join("findings");
+    fs::write(&input, "hello world\nsnowman: \u{2603}\n").unwrap();
+
+    let run = Command::new(bin())
+        .args([
+            "run",
+            "--mode",
+            "boundary",
+            "--target",
+            "python3",
+            "--target-arg",
+            &repo_path("examples/real_adapters/utf8_adapter.py"),
+            "--input",
+            input.to_str().unwrap(),
+            "--iterations",
+            "100",
+            "--seed",
+            "1",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert_eq!(count_saved_findings(&out_dir), 0);
+    let run_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run_json["summary"]["divergences"].as_u64(), Some(0));
+    assert_eq!(run_json["summary"]["saved_findings"].as_u64(), Some(0));
+}
+
+#[test]
 fn duplicate_suppression_can_be_disabled() {
     let dir = temp_dir("dedup");
     let input = dir.join("sample.bin");

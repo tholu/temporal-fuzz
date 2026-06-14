@@ -170,6 +170,16 @@ Wrap the parser or decoder under test in a small executable that translates temp
 
 For parsers that produce structured results, hash a canonical JSON representation. For decoders, hash decoded bytes. For APIs with recoverable parse failures, return `status: "error"` and a deterministic error hash rather than crashing.
 
+## Real Adapter Smoke Tests
+
+Stdlib-only examples live in `examples/real_adapters/`:
+
+- `zlib_adapter.py`
+- `gzip_adapter.py`
+- `utf8_adapter.py`
+
+These wrap robust Python standard-library streaming APIs and are useful smoke tests for the tool itself. In `--mode boundary`, they should produce zero findings because chunking alone should not change decoded output. In `--mode stateful` and `--mode chaos`, findings may be intentional: controls such as `RESET` change decoder state, and chaos mode can generate non-equivalent streams.
+
 ## Example Workflow
 
 Create a sample payload:
@@ -206,6 +216,13 @@ For quick triage, stop after the first saved finding:
 
 ```bash
 cargo run -- run --mode boundary --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 1000 --seed 1 --timeout-ms 200 --out-dir findings/first --stop-on-first
+```
+
+Smoke-test a real stdlib adapter:
+
+```bash
+printf 'hello world\nhello world\n' > sample.txt
+cargo run -- run --mode boundary --target python3 --target-arg examples/real_adapters/utf8_adapter.py --input sample.txt --iterations 100 --seed 1 --out-dir findings/utf8-boundary
 ```
 
 Replay a finding:
