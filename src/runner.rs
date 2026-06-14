@@ -11,7 +11,7 @@ struct AdapterRequest<'a> {
     ops: &'a [Op],
 }
 
-pub fn run_adapter(target: &str, payload: &[u8], ops: &[Op], timeout_ms: u64) -> RunOutcome {
+pub fn run_adapter(target: &[String], payload: &[u8], ops: &[Op], timeout_ms: u64) -> RunOutcome {
     let started = Instant::now();
     let request = AdapterRequest {
         payload_b64: base64_encode(payload),
@@ -33,13 +33,12 @@ pub fn run_adapter(target: &str, payload: &[u8], ops: &[Op], timeout_ms: u64) ->
         }
     };
 
-    let command = split_command(target);
-    if command.is_empty() {
+    if target.is_empty() {
         return spawn_error(started, "empty target command".to_string());
     }
 
-    let mut child = match Command::new(&command[0])
-        .args(&command[1..])
+    let mut child = match Command::new(&target[0])
+        .args(&target[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -48,21 +47,6 @@ pub fn run_adapter(target: &str, payload: &[u8], ops: &[Op], timeout_ms: u64) ->
         Ok(child) => child,
         Err(err) => return spawn_error(started, format!("failed to spawn target: {err}")),
     };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(err) = stdin.write_all(&input).and_then(|_| stdin.flush()) {
-            return RunOutcome {
-                kind: OutcomeKind::SpawnError,
-                adapter: None,
-                exit_code: None,
-                stderr: String::new(),
-                runtime_ms: started.elapsed().as_millis(),
-                max_rss_kb: None,
-                stdout_snippet: String::new(),
-                error: Some(format!("failed to write target stdin: {err}")),
-            };
-        }
-    }
 
     let stdout_handle = child.stdout.take().map(|mut stdout| {
         thread::spawn(move || {
@@ -78,6 +62,12 @@ pub fn run_adapter(target: &str, payload: &[u8], ops: &[Op], timeout_ms: u64) ->
             buf
         })
     });
+
+    let stdin_error = if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&input).and_then(|_| stdin.flush()).err()
+    } else {
+        None
+    };
 
     let timeout = Duration::from_millis(timeout_ms);
     let mut timed_out = false;
@@ -135,7 +125,7 @@ pub fn run_adapter(target: &str, payload: &[u8], ops: &[Op], timeout_ms: u64) ->
             runtime_ms,
             max_rss_kb: None,
             stdout_snippet: snippet(&stdout_text, 4096),
-            error: None,
+            error: stdin_error.map(|err| format!("failed to write target stdin: {err}")),
         };
     }
 
@@ -194,11 +184,4 @@ fn join_reader(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 
 fn valid_adapter_output(output: &AdapterOutput) -> bool {
     matches!(output.status.as_str(), "ok" | "error") && !output.output_hash.is_empty()
-}
-
-fn split_command(target: &str) -> Vec<String> {
-    target
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
 }

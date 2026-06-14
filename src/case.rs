@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +121,10 @@ pub struct Finding {
     pub finding_class: FindingClass,
     pub input_filename: Option<String>,
     pub payload_hash: String,
-    pub payload_b64: String,
+    #[serde(default)]
+    pub payload_b64: Option<String>,
+    #[serde(default)]
+    pub payload_path: Option<String>,
     pub schedule: Vec<Op>,
     pub baseline_result: RunOutcome,
     pub variant_result: RunOutcome,
@@ -129,8 +134,21 @@ pub struct Finding {
 }
 
 impl Finding {
-    pub fn payload(&self) -> Result<Vec<u8>, String> {
-        base64_decode(&self.payload_b64)
+    pub fn payload_from_dir(&self, base_dir: &Path) -> Result<Vec<u8>, String> {
+        if let Some(payload_b64) = &self.payload_b64 {
+            return base64_decode(payload_b64);
+        }
+
+        let Some(payload_path) = &self.payload_path else {
+            return Err("finding has neither payload_b64 nor payload_path".to_string());
+        };
+        let path = Path::new(payload_path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        };
+        fs::read(&path).map_err(|err| format!("failed to read payload {}: {err}", path.display()))
     }
 }
 

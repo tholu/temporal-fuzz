@@ -55,7 +55,9 @@ fn replay_reproduces_generated_case() {
         .args([
             "replay",
             "--target",
-            &format!("python3 {}", repo_path("examples/echo_adapter.py")),
+            "python3",
+            "--target-arg",
+            &repo_path("examples/echo_adapter.py"),
             "--case",
             cases.join("case-000001.json").to_str().unwrap(),
         ])
@@ -81,7 +83,9 @@ fn run_finds_divergence_and_saved_case_is_replayable() {
         .args([
             "run",
             "--target",
-            &format!("python3 {}", repo_path("examples/buggy_adapter.py")),
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
             "--input",
             input.to_str().unwrap(),
             "--iterations",
@@ -110,7 +114,9 @@ fn run_finds_divergence_and_saved_case_is_replayable() {
         .args([
             "replay",
             "--target",
-            &format!("python3 {}", repo_path("examples/buggy_adapter.py")),
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
             "--case",
             divergence.to_str().unwrap(),
             "--timeout-ms",
@@ -137,7 +143,9 @@ fn minimize_reduces_known_case() {
         .args([
             "run",
             "--target",
-            &format!("python3 {}", repo_path("examples/buggy_adapter.py")),
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
             "--input",
             input.to_str().unwrap(),
             "--iterations",
@@ -170,7 +178,9 @@ fn minimize_reduces_known_case() {
         .args([
             "minimize",
             "--target",
-            &format!("python3 {}", repo_path("examples/buggy_adapter.py")),
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
             "--case",
             divergence.to_str().unwrap(),
             "--out",
@@ -192,4 +202,73 @@ fn minimize_reduces_known_case() {
         after_len <= before_len,
         "expected minimized schedule: {before_len} -> {after_len}"
     );
+}
+
+#[test]
+fn compact_saved_finding_remains_replayable() {
+    let dir = temp_dir("compact");
+    let input = dir.join("sample.bin");
+    fs::write(&input, b"0010abcdefghij").unwrap();
+
+    let run = Command::new(bin())
+        .current_dir(&dir)
+        .args([
+            "run",
+            "--target",
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
+            "--input",
+            input.to_str().unwrap(),
+            "--iterations",
+            "10",
+            "--seed",
+            "1",
+            "--timeout-ms",
+            "200",
+            "--embed-payload",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let divergence = fs::read_dir(dir.join("divergences"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .next()
+        .expect("expected divergence finding");
+    let finding: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&divergence).unwrap()).unwrap();
+    assert!(finding["payload_b64"].is_null());
+    assert!(finding["payload_path"]
+        .as_str()
+        .unwrap()
+        .starts_with("payloads/"));
+
+    let replay = Command::new(bin())
+        .args([
+            "replay",
+            "--target",
+            "python3",
+            "--target-arg",
+            &repo_path("examples/buggy_adapter.py"),
+            "--case",
+            divergence.to_str().unwrap(),
+            "--timeout-ms",
+            "200",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(String::from_utf8_lossy(&replay.stdout).contains("\"class\": \"divergence\""));
 }

@@ -13,7 +13,7 @@ cargo build --release
 Run from source:
 
 ```bash
-cargo run -- run --target "python3 examples/echo_adapter.py" --input sample.bin --iterations 100
+cargo run -- run --target python3 --target-arg examples/echo_adapter.py --input sample.bin --iterations 100
 ```
 
 ## Adapter Protocol
@@ -86,6 +86,8 @@ Useful options:
 - `--timeout-ms N` for per-execution timeout
 - `--corpus DIR` to fuzz the primary input plus every file in a corpus directory
 - `--progress-every N` to control progress output
+- `--target-arg ARG` to pass adapter arguments without shell parsing
+- `--embed-payload false` to save payload bytes beside findings instead of embedding base64 in each finding
 
 ## Detection Model
 
@@ -113,7 +115,9 @@ Output directories:
 - `divergences/`
 - `interesting/`
 
-Saved findings include the input filename, embedded payload, payload hash, schedule, baseline result, variant result, stderr snippets, command line, and timestamp.
+Saved findings include the input filename, payload hash, schedule, baseline result, variant result, stderr snippets, command line, and timestamp. By default the payload is embedded as base64 for single-file replayability. With `--embed-payload false`, payload bytes are stored under a `payloads/` directory next to the finding and referenced by relative path.
+
+If the whole-input baseline does not return valid `ok` adapter output, that input is reported as a baseline failure and skipped. This keeps variant findings tied to streaming-vs-whole-input differences rather than a broken adapter setup.
 
 ## Schedule Generation
 
@@ -144,24 +148,23 @@ printf '0010abcdefghij' > sample.bin
 Run against the deterministic echo adapter:
 
 ```bash
-cargo run -- run --target "python3 examples/echo_adapter.py" --input sample.bin --iterations 20 --seed 1
+cargo run -- run --target python3 --target-arg examples/echo_adapter.py --input sample.bin --iterations 20 --seed 1
 ```
 
 Run against the intentionally buggy adapter:
 
 ```bash
-cargo run -- run --target "python3 examples/buggy_adapter.py" --input sample.bin --iterations 100 --seed 1 --timeout-ms 200
+cargo run -- run --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 100 --seed 1 --timeout-ms 200
 ```
 
 Replay a finding:
 
 ```bash
-cargo run -- replay --target "python3 examples/buggy_adapter.py" --case divergences/id-000000.json
+cargo run -- replay --target python3 --target-arg examples/buggy_adapter.py --case divergences/id-000000.json
 ```
 
 Minimize it:
 
 ```bash
-cargo run -- minimize --target "python3 examples/buggy_adapter.py" --case divergences/id-000000.json --out minimized.json
+cargo run -- minimize --target python3 --target-arg examples/buggy_adapter.py --case divergences/id-000000.json --out minimized.json
 ```
-

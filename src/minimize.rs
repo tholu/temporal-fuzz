@@ -1,18 +1,92 @@
-use crate::case::{FindingClass, Op, RunOutcome};
+use crate::case::{FindingClass, Op, OutcomeKind, RunOutcome};
 use crate::classifier::classify;
 use crate::runner::run_adapter;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailurePredicate {
+    class: FindingClass,
+    baseline_kind: OutcomeKind,
+    variant_kind: OutcomeKind,
+    baseline_status: Option<String>,
+    variant_status: Option<String>,
+    baseline_hash: Option<String>,
+    variant_hash: Option<String>,
+    variant_exit_code: Option<i32>,
+    status_mismatch: bool,
+    hash_mismatch: bool,
+}
+
+impl FailurePredicate {
+    pub fn new(baseline: &RunOutcome, variant: &RunOutcome) -> Option<Self> {
+        let class = classify(baseline, variant)?.class;
+        Some(Self {
+            class,
+            baseline_kind: baseline.kind.clone(),
+            variant_kind: variant.kind.clone(),
+            baseline_status: baseline.status().map(ToString::to_string),
+            variant_status: variant.status().map(ToString::to_string),
+            baseline_hash: baseline.output_hash().map(ToString::to_string),
+            variant_hash: variant.output_hash().map(ToString::to_string),
+            variant_exit_code: variant.exit_code,
+            status_mismatch: baseline.status() != variant.status(),
+            hash_mismatch: baseline.output_hash() != variant.output_hash(),
+        })
+    }
+
+    pub fn class(&self) -> FindingClass {
+        self.class
+    }
+
+    fn matches(&self, baseline: &RunOutcome, variant: &RunOutcome) -> bool {
+        if baseline.kind != self.baseline_kind || variant.kind != self.variant_kind {
+            return false;
+        }
+        if variant.kind == OutcomeKind::Crash
+            && self.variant_exit_code.is_some()
+            && variant.exit_code != self.variant_exit_code
+        {
+            return false;
+        }
+        if baseline.status().map(ToString::to_string) != self.baseline_status {
+            return false;
+        }
+        if baseline.output_hash().map(ToString::to_string) != self.baseline_hash {
+            return false;
+        }
+
+        match self.class {
+            FindingClass::Divergence => {
+                if self.status_mismatch
+                    && variant.status().map(ToString::to_string) != self.variant_status
+                {
+                    return false;
+                }
+                if self.hash_mismatch
+                    && variant.output_hash().map(ToString::to_string) != self.variant_hash
+                {
+                    return false;
+                }
+                true
+            }
+            FindingClass::Crash | FindingClass::Hang => true,
+            FindingClass::Interesting => classify(baseline, variant)
+                .map(|classification| classification.class == self.class)
+                .unwrap_or(false),
+        }
+    }
+}
+
 pub fn minimize_schedule(
-    target: &str,
+    target: &[String],
     payload: &[u8],
     initial_ops: &[Op],
     baseline: &RunOutcome,
-    finding_class: FindingClass,
+    predicate: &FailurePredicate,
     timeout_ms: u64,
 ) -> (Vec<Op>, RunOutcome) {
     let mut ops = initial_ops.to_vec();
     let mut outcome = run_adapter(target, payload, &ops, timeout_ms);
-    if !preserves(baseline, &outcome, finding_class) {
+    if !predicate.matches(baseline, &outcome) {
         return (ops, outcome);
     }
 
@@ -26,7 +100,7 @@ pub fn minimize_schedule(
                 continue;
             }
             let candidate_outcome = run_adapter(target, payload, &candidate, timeout_ms);
-            if preserves(baseline, &candidate_outcome, finding_class) {
+            if predicate.matches(baseline, &candidate_outcome) {
                 ops = candidate;
                 outcome = candidate_outcome;
                 changed = true;
@@ -37,14 +111,14 @@ pub fn minimize_schedule(
 
     let merged = merge_adjacent_feeds(&ops);
     let merged_outcome = run_adapter(target, payload, &merged, timeout_ms);
-    if preserves(baseline, &merged_outcome, finding_class) {
+    if predicate.matches(baseline, &merged_outcome) {
         ops = merged;
         outcome = merged_outcome;
     }
 
     let simplified = simplify_values(&ops);
     let simplified_outcome = run_adapter(target, payload, &simplified, timeout_ms);
-    if preserves(baseline, &simplified_outcome, finding_class) {
+    if predicate.matches(baseline, &simplified_outcome) {
         ops = simplified;
         outcome = simplified_outcome;
     }
@@ -53,18 +127,12 @@ pub fn minimize_schedule(
         target,
         payload,
         baseline,
-        finding_class,
+        predicate,
         timeout_ms,
         &mut ops,
         &mut outcome,
     );
     (ops, outcome)
-}
-
-fn preserves(baseline: &RunOutcome, variant: &RunOutcome, finding_class: FindingClass) -> bool {
-    classify(baseline, variant)
-        .map(|classification| classification.class == finding_class)
-        .unwrap_or(false)
 }
 
 fn merge_adjacent_feeds(ops: &[Op]) -> Vec<Op> {
@@ -97,10 +165,10 @@ fn simplify_values(ops: &[Op]) -> Vec<Op> {
 }
 
 fn shrink_feed_lengths(
-    target: &str,
+    target: &[String],
     payload: &[u8],
     baseline: &RunOutcome,
-    finding_class: FindingClass,
+    predicate: &FailurePredicate,
     timeout_ms: u64,
     ops: &mut Vec<Op>,
     outcome: &mut RunOutcome,
@@ -117,7 +185,7 @@ fn shrink_feed_lengths(
                 *len = candidate_len;
             }
             let candidate_outcome = run_adapter(target, payload, &candidate, timeout_ms);
-            if preserves(baseline, &candidate_outcome, finding_class) {
+            if predicate.matches(baseline, &candidate_outcome) {
                 *ops = candidate;
                 *outcome = candidate_outcome;
             } else if candidate_len == 1 {
