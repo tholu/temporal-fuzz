@@ -13,6 +13,7 @@ use crate::runner::run_adapter;
 use crate::schedule::{ScheduleGenerator, ScheduleMode};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,8 @@ enum Command {
         embed_payload: bool,
         mode: ScheduleMode,
         out_dir: PathBuf,
+        save_duplicates: bool,
+        max_findings: Option<usize>,
     },
     Replay {
         target: Vec<String>,
@@ -63,6 +66,13 @@ struct Summary {
     divergences: usize,
     interesting: usize,
     baseline_failures: usize,
+    saved_findings: usize,
+    duplicate_findings: usize,
+    max_findings_reached: bool,
+    saved_crashes: usize,
+    saved_hangs: usize,
+    saved_divergences: usize,
+    saved_interesting: usize,
 }
 
 #[derive(Debug)]
@@ -78,20 +88,31 @@ struct RunOptions<'a> {
     embed_payload: bool,
     mode: ScheduleMode,
     out_dir: &'a Path,
+    save_duplicates: bool,
+    max_findings: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 struct RunMetadata {
     command_line: Vec<String>,
     target_argv: Vec<String>,
+    out_dir: String,
     seed: u64,
     mode: ScheduleMode,
     input_path: String,
     corpus_path: Option<String>,
     iterations: usize,
     timeout_ms: u64,
+    save_duplicates: bool,
+    max_findings: Option<usize>,
     summary: Summary,
     timestamp: u64,
+}
+
+#[derive(Debug)]
+struct SavedFindingPath {
+    class: FindingClass,
+    path: PathBuf,
 }
 
 fn main() {
@@ -116,6 +137,8 @@ fn real_main() -> Result<(), String> {
             embed_payload,
             mode,
             out_dir,
+            save_duplicates,
+            max_findings,
         } => run_command(RunOptions {
             command_line: &args,
             target: &target,
@@ -128,6 +151,8 @@ fn real_main() -> Result<(), String> {
             embed_payload,
             mode,
             out_dir: &out_dir,
+            save_duplicates,
+            max_findings,
         }),
         Command::Replay {
             target,
@@ -166,8 +191,11 @@ fn real_main() -> Result<(), String> {
 
 fn run_command(options: RunOptions<'_>) -> Result<(), String> {
     ensure_output_dirs(options.out_dir)?;
+    let normalized_out_dir = normalize_path(options.out_dir);
     let inputs = collect_input_paths(options.input, options.corpus)?;
     let mut summary = Summary::default();
+    let mut seen_dedup_keys = HashSet::new();
+    let mut saved_paths = Vec::new();
 
     for input_path in inputs {
         let payload = read_payload(&input_path)?;
@@ -187,12 +215,27 @@ fn run_command(options: RunOptions<'_>) -> Result<(), String> {
         let mut generator = ScheduleGenerator::new(options.seed);
 
         for iteration in 0..options.iterations {
+            if summary.max_findings_reached {
+                break;
+            }
             let case = generator.next_case(input_name.clone(), &payload, iteration, options.mode);
             let variant = run_adapter(options.target, &payload, &case.ops, options.timeout_ms);
             summary.total += 1;
 
             if let Some(classification) = classify(&baseline, &variant) {
                 increment_summary(&mut summary, classification.class);
+                let dedup_key = dedup_key(
+                    &case.payload_hash,
+                    &case.schedule_metadata,
+                    &classification.reason,
+                    &baseline,
+                    &variant,
+                );
+                if !options.save_duplicates && !seen_dedup_keys.insert(dedup_key) {
+                    summary.duplicate_findings += 1;
+                    continue;
+                }
+
                 let finding = Finding {
                     finding_class: classification.class,
                     input_filename: input_name.clone(),
@@ -207,51 +250,83 @@ fn run_command(options: RunOptions<'_>) -> Result<(), String> {
                     command_line: options.command_line.to_vec(),
                     timestamp: now_unix_secs(),
                 };
-                save_finding(
+                let saved_path = save_finding(
                     &finding,
                     iteration,
                     options.embed_payload,
                     &payload,
                     options.out_dir,
                 )?;
+                increment_saved_summary(&mut summary, classification.class);
+                saved_paths.push(SavedFindingPath {
+                    class: classification.class,
+                    path: saved_path,
+                });
+
+                if options
+                    .max_findings
+                    .map(|max_findings| summary.saved_findings >= max_findings)
+                    .unwrap_or(false)
+                {
+                    summary.max_findings_reached = true;
+                    break;
+                }
             }
 
             if options.progress_every > 0 && summary.total % options.progress_every == 0 {
                 eprintln!(
-                    "progress total={} crashes={} hangs={} divergences={} interesting={} baseline_failures={}",
+                    "progress total={} crashes={} hangs={} divergences={} interesting={} baseline_failures={} saved_findings={} duplicate_findings={}",
                     summary.total,
                     summary.crashes,
                     summary.hangs,
                     summary.divergences,
                     summary.interesting,
-                    summary.baseline_failures
+                    summary.baseline_failures,
+                    summary.saved_findings,
+                    summary.duplicate_findings
                 );
             }
+        }
+
+        if summary.max_findings_reached {
+            break;
         }
     }
 
     println!(
-        "summary total={} crashes={} hangs={} divergences={} interesting={} baseline_failures={}",
+        "summary total={} crashes={} hangs={} divergences={} interesting={} baseline_failures={} saved_findings={} duplicate_findings={} max_findings_reached={}",
         summary.total,
         summary.crashes,
         summary.hangs,
         summary.divergences,
         summary.interesting,
-        summary.baseline_failures
+        summary.baseline_failures,
+        summary.saved_findings,
+        summary.duplicate_findings,
+        summary.max_findings_reached
     );
     let run_metadata = RunMetadata {
         command_line: options.command_line.to_vec(),
         target_argv: options.target.to_vec(),
+        out_dir: normalized_out_dir.display().to_string(),
         seed: options.seed,
         mode: options.mode,
         input_path: options.input.display().to_string(),
         corpus_path: options.corpus.map(|path| path.display().to_string()),
         iterations: options.iterations,
         timeout_ms: options.timeout_ms,
+        save_duplicates: options.save_duplicates,
+        max_findings: options.max_findings,
         summary,
         timestamp: now_unix_secs(),
     };
     write_json(&options.out_dir.join("run.json"), &run_metadata)?;
+    write_summary_markdown(
+        &options,
+        &normalized_out_dir,
+        &run_metadata.summary,
+        &saved_paths,
+    )?;
     Ok(())
 }
 
@@ -465,12 +540,13 @@ fn save_finding(
     embed_payload: bool,
     payload: &[u8],
     out_dir: &Path,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let dir = finding.finding_class.dir_name();
     let finding_dir = out_dir.join(dir);
     let path = finding_dir.join(format!("id-{}-{iteration:06}.json", finding.timestamp));
     let finding = prepare_finding_payload(finding.clone(), &finding_dir, embed_payload, payload)?;
-    write_json(&path, &finding)
+    write_json(&path, &finding)?;
+    Ok(path)
 }
 
 fn prepare_finding_payload(
@@ -520,6 +596,125 @@ fn increment_summary(summary: &mut Summary, class: FindingClass) {
     }
 }
 
+fn increment_saved_summary(summary: &mut Summary, class: FindingClass) {
+    summary.saved_findings += 1;
+    match class {
+        FindingClass::Crash => summary.saved_crashes += 1,
+        FindingClass::Hang => summary.saved_hangs += 1,
+        FindingClass::Divergence => summary.saved_divergences += 1,
+        FindingClass::Interesting => summary.saved_interesting += 1,
+    }
+}
+
+fn dedup_key(
+    payload_hash: &str,
+    metadata: &ScheduleMetadata,
+    reason: &str,
+    baseline: &crate::case::RunOutcome,
+    variant: &crate::case::RunOutcome,
+) -> String {
+    let raw = format!(
+        "payload={payload_hash}\nschedule_class={:?}\nreason={reason}\nbaseline_status={:?}\nbaseline_hash={:?}\nvariant_status={:?}\nvariant_hash={:?}\nbaseline_kind={:?}\nvariant_kind={:?}",
+        metadata.schedule_class,
+        baseline.status(),
+        baseline.output_hash(),
+        variant.status(),
+        variant.output_hash(),
+        baseline.kind,
+        variant.kind
+    );
+    crate::case::stable_hash_hex(raw.as_bytes())
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn write_summary_markdown(
+    options: &RunOptions<'_>,
+    normalized_out_dir: &Path,
+    summary: &Summary,
+    saved_paths: &[SavedFindingPath],
+) -> Result<(), String> {
+    let mut text = String::new();
+    text.push_str("# temporal-fuzz Summary\n\n");
+    text.push_str(&format!("- mode: {:?}\n", options.mode));
+    text.push_str(&format!("- target argv: `{}`\n", options.target.join(" ")));
+    text.push_str(&format!("- input path: `{}`\n", options.input.display()));
+    text.push_str(&format!(
+        "- corpus path: `{}`\n",
+        options
+            .corpus
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ));
+    text.push_str(&format!("- seed: {}\n", options.seed));
+    text.push_str(&format!("- iterations: {}\n", options.iterations));
+    text.push_str(&format!("- timeout_ms: {}\n", options.timeout_ms));
+    text.push_str(&format!("- save_duplicates: {}\n", options.save_duplicates));
+    text.push_str(&format!(
+        "- max_findings: {}\n",
+        options
+            .max_findings
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ));
+    text.push_str(&format!(
+        "- out_dir: `{}`\n\n",
+        normalized_out_dir.display()
+    ));
+
+    text.push_str("## Counts\n\n");
+    text.push_str(&format!("- total: {}\n", summary.total));
+    text.push_str(&format!("- crashes: {}\n", summary.crashes));
+    text.push_str(&format!("- hangs: {}\n", summary.hangs));
+    text.push_str(&format!("- divergences: {}\n", summary.divergences));
+    text.push_str(&format!("- interesting: {}\n", summary.interesting));
+    text.push_str(&format!(
+        "- baseline_failures: {}\n",
+        summary.baseline_failures
+    ));
+    text.push_str(&format!("- saved_findings: {}\n", summary.saved_findings));
+    text.push_str(&format!(
+        "- duplicate_findings: {}\n",
+        summary.duplicate_findings
+    ));
+    text.push_str(&format!(
+        "- max_findings_reached: {}\n\n",
+        summary.max_findings_reached
+    ));
+
+    text.push_str("## Output Directories\n\n");
+    for dir in ["crashes", "hangs", "divergences", "interesting"] {
+        text.push_str(&format!("- `{}`\n", options.out_dir.join(dir).display()));
+    }
+
+    text.push_str("\n## First Findings\n\n");
+    for class in [
+        FindingClass::Crash,
+        FindingClass::Hang,
+        FindingClass::Divergence,
+        FindingClass::Interesting,
+    ] {
+        let paths = saved_paths
+            .iter()
+            .filter(|saved| saved.class == class)
+            .take(5)
+            .map(|saved| format!("- `{}`", saved.path.display()))
+            .collect::<Vec<_>>();
+        text.push_str(&format!("### {:?}\n\n", class));
+        if paths.is_empty() {
+            text.push_str("- none\n\n");
+        } else {
+            text.push_str(&paths.join("\n"));
+            text.push_str("\n\n");
+        }
+    }
+
+    fs::write(options.out_dir.join("SUMMARY.md"), text)
+        .map_err(|err| format!("failed to write SUMMARY.md: {err}"))
+}
+
 fn parse_args(args: &[String]) -> Result<Command, String> {
     if args.len() == 2 && is_help_flag(&args[1]) {
         return Ok(Command::Help(root_usage()));
@@ -555,9 +750,22 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     "--embed-payload",
                     "--mode",
                     "--out-dir",
+                    "--save-duplicates",
+                    "--max-findings",
+                    "--stop-on-first",
                 ],
                 &["--target-arg"],
+                &["--stop-on-first"],
             )?;
+            let stop_on_first = flags.has("--stop-on-first");
+            let max_findings = if stop_on_first {
+                Some(1)
+            } else {
+                flags.parse_optional_value("--max-findings")?
+            };
+            if matches!(max_findings, Some(0)) {
+                return Err("--max-findings must be greater than 0".to_string());
+            }
             Ok(Command::Run {
                 target: target_argv(&flags)?,
                 input: PathBuf::from(flags.required("--input")?),
@@ -573,6 +781,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                         .optional("--out-dir")
                         .unwrap_or_else(|| ".".to_string()),
                 ),
+                save_duplicates: flags.parse_bool_optional("--save-duplicates", false)?,
+                max_findings,
             })
         }
         "replay" => {
@@ -580,6 +790,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 &args[2..],
                 &["--target", "--target-arg", "--case", "--timeout-ms"],
                 &["--target-arg"],
+                &[],
             )?;
             Ok(Command::Replay {
                 target: target_argv(&flags)?,
@@ -591,6 +802,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let flags = parse_flags(
                 &args[2..],
                 &["--input", "--out", "--count", "--seed", "--mode"],
+                &[],
                 &[],
             )?;
             Ok(Command::Generate {
@@ -614,6 +826,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     "--mode",
                 ],
                 &["--target-arg"],
+                &[],
             )?;
             Ok(Command::Minimize {
                 target: target_argv(&flags)?,
@@ -646,6 +859,10 @@ impl Flags {
             .map(|(_, value)| value.clone())
     }
 
+    fn has(&self, flag: &str) -> bool {
+        self.values.iter().any(|(candidate, _)| candidate == flag)
+    }
+
     fn all(&self, flag: &str) -> Vec<String> {
         self.values
             .iter()
@@ -665,6 +882,20 @@ impl Flags {
                 .map_err(|err| format!("invalid value for {flag}: {err}")),
             None => Ok(default),
         }
+    }
+
+    fn parse_optional_value<T>(&self, flag: &str) -> Result<Option<T>, String>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        self.optional(flag)
+            .map(|value| {
+                value
+                    .parse::<T>()
+                    .map_err(|err| format!("invalid value for {flag}: {err}"))
+            })
+            .transpose()
     }
 
     fn parse_bool_optional(&self, flag: &str, default: bool) -> Result<bool, String> {
@@ -690,7 +921,12 @@ impl Flags {
     }
 }
 
-fn parse_flags(args: &[String], allowed: &[&str], repeatable: &[&str]) -> Result<Flags, String> {
+fn parse_flags(
+    args: &[String],
+    allowed: &[&str],
+    repeatable: &[&str],
+    valueless: &[&str],
+) -> Result<Flags, String> {
     let mut values = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
@@ -703,6 +939,14 @@ fn parse_flags(args: &[String], allowed: &[&str], repeatable: &[&str]) -> Result
         }
         if !allowed.contains(&flag) {
             return Err(format!("unknown flag {flag}\n\n{}", root_usage()));
+        }
+        if valueless.contains(&flag) {
+            if !repeatable.contains(&flag) && values.iter().any(|(existing, _)| existing == flag) {
+                return Err(format!("duplicate flag {flag}\n\n{}", root_usage()));
+            }
+            values.push((flag.to_string(), "true".to_string()));
+            idx += 1;
+            continue;
         }
         let Some(value) = args.get(idx + 1) else {
             return Err(format!("missing value for {flag}\n\n{}", root_usage()));
@@ -741,7 +985,7 @@ fn is_help_flag(arg: &str) -> bool {
 
 fn root_usage() -> String {
     "usage:
-  temporal-fuzz run --target ./adapter [--target-arg ARG ...] --input sample.bin --iterations 10000 [--mode boundary|stateful|chaos] [--out-dir DIR] [--seed N] [--timeout-ms N] [--corpus DIR] [--embed-payload true|false]
+  temporal-fuzz run --target ./adapter [--target-arg ARG ...] --input sample.bin --iterations 10000 [--mode boundary|stateful|chaos] [--out-dir DIR] [--seed N] [--timeout-ms N] [--corpus DIR] [--embed-payload true|false] [--save-duplicates true|false] [--max-findings N] [--stop-on-first]
   temporal-fuzz replay --target ./adapter [--target-arg ARG ...] --case crashes/id.json [--timeout-ms N]
   temporal-fuzz generate --input sample.bin --out cases/ --count 1000 [--mode boundary|stateful|chaos] [--seed N]
   temporal-fuzz minimize --target ./adapter [--target-arg ARG ...] --case crashes/id.json --out minimized.json [--mode boundary|stateful|chaos] [--timeout-ms N] [--embed-payload true|false]
@@ -761,7 +1005,10 @@ options:
   --timeout-ms N                   Per-adapter timeout (default: 1000)
   --corpus DIR                     Additional input corpus directory
   --progress-every N               Progress interval (default: 100)
-  --embed-payload true|false       Embed payload bytes in findings (default: true)"
+  --embed-payload true|false       Embed payload bytes in findings (default: true)
+  --save-duplicates true|false     Save duplicate semantic findings (default: false)
+  --max-findings N                 Stop after N saved findings
+  --stop-on-first                  Stop after the first saved finding"
         .to_string()
 }
 

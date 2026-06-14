@@ -90,6 +90,9 @@ Useful options:
 - `--progress-every N` to control progress output
 - `--target-arg ARG` to pass adapter arguments without shell parsing
 - `--embed-payload false` to save payload bytes beside findings instead of embedding base64 in each finding
+- `--save-duplicates true` to save every classified finding instead of suppressing semantic duplicates
+- `--max-findings N` to stop after N saved findings
+- `--stop-on-first` as shorthand for `--max-findings 1`
 
 Help is available at the root and for each command:
 
@@ -140,7 +143,12 @@ Output directories under `--out-dir`:
 
 Saved findings include the input filename, payload hash, schedule, schedule metadata, baseline result, variant result, stderr snippets, command line, and timestamp. By default the payload is embedded as base64 for single-file replayability. With `--embed-payload false`, payload bytes are stored under a `payloads/` directory next to the finding and referenced by relative path.
 
-Each run also writes `<out-dir>/run.json` with command line, target argv, seed, mode, input/corpus paths, iteration count, timeout, final summary counts, and timestamp.
+By default, a run suppresses duplicate semantic findings. The deduplication key includes the payload hash, schedule class, classification reason, and baseline/variant status and output hashes. Classification counters still count every classified result; `saved_findings` and `duplicate_findings` show how many were written or suppressed. Use `--save-duplicates true` when you want the older save-everything behavior for corpus analysis or generator debugging.
+
+Each run also writes:
+
+- `<out-dir>/run.json` with command line, target argv, normalized `out_dir`, seed, mode, input/corpus paths, iteration count, timeout, dedup/stop options, summary counts, and timestamp.
+- `<out-dir>/SUMMARY.md` with a short human-readable report, output directories, and the first few saved finding paths per class.
 
 If the whole-input baseline does not return valid `ok` adapter output, that input is reported as a baseline failure and skipped. This keeps variant findings tied to streaming-vs-whole-input differences rather than a broken adapter setup.
 
@@ -182,10 +190,22 @@ Run the recommended boundary pass against the intentionally buggy adapter:
 cargo run -- run --mode boundary --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 100 --seed 1 --timeout-ms 200 --out-dir findings/buggy-boundary
 ```
 
+Then run stateful mode to exercise streaming controls while still preserving the effective byte stream:
+
+```bash
+cargo run -- run --mode stateful --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 100 --seed 1 --timeout-ms 200 --out-dir findings/buggy-stateful
+```
+
 Run chaos mode when you intentionally want non-equivalent stream and state-machine stress:
 
 ```bash
 cargo run -- run --mode chaos --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 100 --seed 1 --timeout-ms 200 --out-dir findings/buggy-chaos
+```
+
+For quick triage, stop after the first saved finding:
+
+```bash
+cargo run -- run --mode boundary --target python3 --target-arg examples/buggy_adapter.py --input sample.bin --iterations 1000 --seed 1 --timeout-ms 200 --out-dir findings/first --stop-on-first
 ```
 
 Replay a finding:

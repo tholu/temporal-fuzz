@@ -24,6 +24,13 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn count_saved_findings(out_dir: &Path) -> usize {
+    ["crashes", "hangs", "divergences", "interesting"]
+        .iter()
+        .map(|subdir| fs::read_dir(out_dir.join(subdir)).unwrap().count())
+        .sum()
+}
+
 #[test]
 fn replay_reproduces_generated_case() {
     let dir = temp_dir("replay");
@@ -335,8 +342,152 @@ fn boundary_mode_echo_adapter_produces_zero_findings() {
     let run_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(out_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(run_json["mode"].as_str(), Some("boundary"));
+    let normalized_out_dir = fs::canonicalize(&out_dir).unwrap();
+    assert_eq!(
+        run_json["out_dir"].as_str(),
+        Some(normalized_out_dir.to_str().unwrap())
+    );
     assert_eq!(run_json["target_argv"][0].as_str(), Some("python3"));
     assert_eq!(run_json["summary"]["divergences"].as_u64(), Some(0));
+    assert_eq!(run_json["summary"]["saved_findings"].as_u64(), Some(0));
+    assert_eq!(run_json["summary"]["duplicate_findings"].as_u64(), Some(0));
+
+    let summary_md = fs::read_to_string(out_dir.join("SUMMARY.md")).unwrap();
+    assert!(summary_md.contains("# temporal-fuzz Summary"));
+    assert!(summary_md.contains("- mode: Boundary"));
+    assert!(summary_md.contains("- saved_findings: 0"));
+}
+
+#[test]
+fn duplicate_suppression_can_be_disabled() {
+    let dir = temp_dir("dedup");
+    let input = dir.join("sample.bin");
+    let dedup_out = dir.join("dedup");
+    let duplicate_out = dir.join("duplicates");
+    let adapter = repo_path("examples/buggy_adapter.py");
+    fs::write(&input, b"0010abcdefghij").unwrap();
+
+    for (out_dir, extra_args) in [
+        (dedup_out.as_path(), Vec::<&str>::new()),
+        (duplicate_out.as_path(), vec!["--save-duplicates", "true"]),
+    ] {
+        let mut args = vec![
+            "run",
+            "--mode",
+            "boundary",
+            "--target",
+            "python3",
+            "--target-arg",
+            &adapter,
+            "--input",
+            input.to_str().unwrap(),
+            "--iterations",
+            "100",
+            "--seed",
+            "1",
+            "--timeout-ms",
+            "200",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ];
+        args.extend(extra_args);
+        let run = Command::new(bin()).args(args).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let dedup_saved = count_saved_findings(&dedup_out);
+    let duplicate_saved = count_saved_findings(&duplicate_out);
+    assert!(
+        dedup_saved > 0,
+        "expected deduplicated run to save at least one finding"
+    );
+    assert!(
+        duplicate_saved > dedup_saved,
+        "expected duplicate-saving run to save more findings: {duplicate_saved} <= {dedup_saved}"
+    );
+
+    let dedup_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dedup_out.join("run.json")).unwrap()).unwrap();
+    let duplicate_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(duplicate_out.join("run.json")).unwrap()).unwrap();
+    assert_eq!(
+        dedup_json["summary"]["saved_findings"].as_u64(),
+        Some(dedup_saved as u64)
+    );
+    assert!(
+        dedup_json["summary"]["duplicate_findings"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "expected duplicate suppression to record suppressed duplicates"
+    );
+    assert_eq!(duplicate_json["save_duplicates"].as_bool(), Some(true));
+    assert_eq!(
+        duplicate_json["summary"]["saved_findings"].as_u64(),
+        Some(duplicate_saved as u64)
+    );
+    assert_eq!(
+        duplicate_json["summary"]["saved_findings"].as_u64(),
+        duplicate_json["summary"]["divergences"].as_u64()
+    );
+    assert_eq!(
+        duplicate_json["summary"]["duplicate_findings"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn max_findings_and_stop_on_first_stop_after_one_saved_finding() {
+    let dir = temp_dir("stop-controls");
+    let input = dir.join("sample.bin");
+    let adapter = repo_path("examples/buggy_adapter.py");
+    fs::write(&input, b"0010abcdefghij").unwrap();
+
+    for (name, extra_args) in [
+        ("max", vec!["--max-findings", "1"]),
+        ("first", vec!["--stop-on-first"]),
+    ] {
+        let out_dir = dir.join(name);
+        let mut args = vec![
+            "run",
+            "--mode",
+            "boundary",
+            "--target",
+            "python3",
+            "--target-arg",
+            &adapter,
+            "--input",
+            input.to_str().unwrap(),
+            "--iterations",
+            "100",
+            "--seed",
+            "1",
+            "--timeout-ms",
+            "200",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ];
+        args.extend(extra_args);
+        let run = Command::new(bin()).args(args).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        assert_eq!(count_saved_findings(&out_dir), 1);
+        let run_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out_dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(run_json["summary"]["saved_findings"].as_u64(), Some(1));
+        assert_eq!(
+            run_json["summary"]["max_findings_reached"].as_bool(),
+            Some(true)
+        );
+    }
 }
 
 #[test]
